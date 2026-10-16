@@ -10,7 +10,12 @@ _repo = DatabaseRepository()
 @router.get("/stats")
 async def get_performance_stats():
     """Honest statistical metrics (Win Rate, Total Signals, Wins, Losses, Draws)."""
-    return await _repo.get_stats()
+    try:
+        stats = await _repo.get_cumulative_stats()
+        return stats
+    except Exception as e:
+        # Return a safe error payload so UI / caller sees the failure reason
+        return {"error": "failed to fetch stats", "details": str(e)}
 
 
 @router.post("/kill-switch/toggle")
