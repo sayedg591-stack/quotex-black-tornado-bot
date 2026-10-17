@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     KILL_SWITCH_ACTIVE: bool = Field(default=False, description="Pause new signal dispatches")
     PAPER_MODE: bool = Field(default=True, description="Dry run mode for honest recordkeeping")
 
+    # Martingale / MTG settings
+    MARTINGALE_ENABLED: bool = Field(default=True, description="Enable martingale mtg1 automation")
+    MARTINGALE_BASE_STAKE: float = Field(default=1.0, description="Base stake for martingale")
+    MARTINGALE_MAX_STEPS: int = Field(default=3, description="Maximum martingale steps")
+    MARTINGALE_MAX_STAKE: float = Field(default=100.0, description="Maximum stake allowed for martingale")
+    MARTINGALE_MODE: str = Field(default="fixed", description="'fixed' or 'percentage' stake mode")
+
     # Configurable Symbol List (defaults to 48 canonical OTC pairs)
     ACTIVE_SYMBOLS: List[str] = [
         "AUDCAD-OTC", "AUDCHF-OTC", "AUDJPY-OTC", "AUDNZD-OTC", "AUDUSD-OTC", "BRLUSD-OTC",
