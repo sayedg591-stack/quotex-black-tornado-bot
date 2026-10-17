@@ -6,6 +6,7 @@ from app.config import settings
 from app.feed.candle_store import candle_store
 from app.database.repository import DatabaseRepository
 from app.notifications.telegram import telegram_notifier
+from app.trading.martingale import MartingaleManager
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +14,8 @@ logger = logging.getLogger(__name__)
 class OutcomeTracker:
     def __init__(self, db_repo: DatabaseRepository):
         self.db = db_repo
+        # instantiate martingale manager for automated recovery handling
+        self.mtg = MartingaleManager(db_repo)
 
     def _get_field(self, obj: AnyType, *keys, default=None):
         """Helper to retrieve a value from either a mapping or an ORM object.
@@ -115,16 +118,84 @@ class OutcomeTracker:
             "evaluated_at": now_ts,
         }
 
-        # Save to database (releases global lock)
-        await self.db.resolve_signal(sig_id, outcome_data)
+        # Determine if this signal is a martingale recovery (has parent)
+        details_json = self._get_field(active_sig, "details_json")
+        parent_id = None
+        try:
+            details = json.loads(details_json) if details_json else {}
+            parent_id = details.get("parent")
+        except Exception:
+            details = {}
+            parent_id = None
 
-        # Fetch cumulative win/loss counts for Telegram notification
+        # If this is a primary signal that LOST, we DO NOT finalize it here.
+        # Instead, create an MTG recovery attempt and mark the parent PENDING_RECOVERY.
+        if outcome == "LOSS" and not parent_id:
+            # create recovery and mark parent pending; do not broadcast now
+            created = await self.mtg.handle_loss(active_sig)
+            if created:
+                logger.info(f"Parent {sig_id} marked for MTG recovery (created {created}); deferring final outcome broadcast")
+                return True
+            else:
+                # if for some reason recovery wasn't created, we fallback to resolving as LOSS
+                await self.db.resolve_signal(sig_id, outcome_data)
+                # broadcast regular LOSS
+        else:
+            # For all other cases (WIN, DRAW, UNVERIFIED) OR for recovery signals, persist the result
+            await self.db.resolve_signal(sig_id, outcome_data)
+
+        # If this was a recovery signal with a parent, we should finalize the parent's outcome accordingly
+        if parent_id:
+            # parent exists -> this was a recovery attempt
+            # If recovery won, parent is MTG_WIN; otherwise parent is LOSS
+            if outcome == "WIN":
+                parent_outcome = "MTG_WIN"
+            else:
+                parent_outcome = "LOSS"
+
+            # finalize parent via martingale manager (this will resolve parent and insert outcome)
+            ok = await self.mtg.finalize(parent_id, parent_outcome, info={
+                "entry_quote": outcome_data.get("entry_quote"),
+                "expiry_quote": outcome_data.get("expiry_quote"),
+                "price_delta": outcome_data.get("price_delta"),
+                "is_verified": outcome_data.get("is_verified", False),
+                "reason": f"MTG resolution from {sig_id}",
+            })
+
+            if ok:
+                # broadcast final parent outcome
+                stats = await self.db.get_cumulative_stats()
+                wins_count = stats.get("wins", 0)
+                losses_count = stats.get("losses", 0)
+                win_rate = stats.get("win_rate", 0.0)
+
+                outcome_payload = {
+                    "signal_id": parent_id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "outcome": parent_outcome,
+                    "entry_quote": outcome_data.get("entry_quote"),
+                    "expiry_quote": outcome_data.get("expiry_quote"),
+                    "price_delta": outcome_data.get("price_delta"),
+                    "strategy_name": details.get("strategy_name", self._get_field(active_sig, "strategy_name", default="Black Tornado")),
+                    "intended_entry_time": entry_ts,
+                    "intended_expiry_time": expiry_ts,
+                    "wins_count": wins_count,
+                    "losses_count": losses_count,
+                    "win_rate_percent": win_rate,
+                }
+                await telegram_notifier.broadcast_outcome(outcome_payload)
+                return True
+            else:
+                logger.error(f"Failed to finalize parent MTG for {parent_id}")
+                return True
+
+        # For non-parent signals that were finalized above, broadcast normal outcome
         stats = await self.db.get_cumulative_stats()
         wins_count = stats.get("wins", 0)
         losses_count = stats.get("losses", 0)
         win_rate = stats.get("win_rate", 0.0)
 
-        # Dispatch Telegram notification in Black Tornado format
         outcome_payload = {
             "signal_id": sig_id,
             "symbol": symbol,
